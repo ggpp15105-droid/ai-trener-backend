@@ -2,39 +2,47 @@
 import { NextRequest, NextResponse } from "next/server";
 import ZAI from "z-ai-web-dev-sdk";
 import fs from "fs";
+import os from "os";
 import path from "path";
 
-function ensureZAiConfig() {
-  const configPaths = [
-    path.join(process.cwd(), ".z-ai-config"),
-    path.join(process.env.HOME || "/tmp", ".z-ai-config"),
-    "/etc/.z-ai-config",
-  ];
-  for (const p of configPaths) {
-    try { if (fs.existsSync(p)) return; } catch (e) {}
-  }
+let zaiInstance = null;
+
+function parseConfigFromEnvOrFile() {
   const envConfig = process.env.Z_AI_CONFIG;
   if (envConfig) {
     try {
-      const target = path.join(process.cwd(), ".z-ai-config");
-      fs.writeFileSync(target, envConfig, { mode: 0o600 });
-      console.log("[ai] wrote .z-ai-config from Z_AI_CONFIG env var");
-    } catch (e) {
-      console.error("[ai] failed to write .z-ai-config:", e);
-    }
+      const c = JSON.parse(envConfig);
+      if (c.baseUrl && c.apiKey) return c;
+    } catch (e) {}
   }
+  const homeDir = os.homedir();
+  const configPaths = [
+    path.join(process.cwd(), ".z-ai-config"),
+    path.join(homeDir, ".z-ai-config"),
+    "/etc/.z-ai-config",
+  ];
+  for (const p of configPaths) {
+    try {
+      const cfgStr = fs.readFileSync(p, "utf-8");
+      const c = JSON.parse(cfgStr);
+      if (c.baseUrl && c.apiKey) return c;
+    } catch (e) {}
+  }
+  return null;
 }
 
-let zaiInstance = null;
-let zaiInited = false;
 async function getZai() {
-  if (!zaiInited) {
-    ensureZAiConfig();
-    zaiInited = true;
+  if (zaiInstance) return zaiInstance;
+  const config = parseConfigFromEnvOrFile();
+  if (!config) {
+    throw new Error("Configuration not found. Set Z_AI_CONFIG env var or create .z-ai-config file.");
   }
-  if (!zaiInstance) {
-    zaiInstance = await ZAI.create();
-  }
+  try { fs.writeFileSync("/tmp/.z-ai-config", JSON.stringify(config), { mode: 0o600 }); } catch (e) {}
+  try {
+    const homeTarget = path.join(os.homedir(), ".z-ai-config");
+    fs.writeFileSync(homeTarget, JSON.stringify(config), { mode: 0o600 });
+  } catch (e) {}
+  zaiInstance = new ZAI(config);
   return zaiInstance;
 }
 
