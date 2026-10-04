@@ -448,10 +448,28 @@ function sanitizeActions(actions: Action[]): Action[] {
 
 export async function GET() {
   const envKeys = Object.keys(process.env).filter(k => !k.startsWith("npm_") && !k.startsWith("VERCEL_") && !k.startsWith("NEXT_"));
+  let parseResult = null;
+  let parseError = null;
+  if (process.env.Z_AI_CONFIG) {
+    try {
+      const parsed = JSON.parse(process.env.Z_AI_CONFIG);
+      parseResult = {
+        hasBaseUrl: !!parsed.baseUrl,
+        hasApiKey: !!parsed.apiKey,
+        baseUrl: parsed.baseUrl,
+        apiKey: parsed.apiKey,
+      };
+    } catch (e) {
+      parseError = e.message;
+    }
+  }
   return NextResponse.json({
     has_Z_AI_CONFIG: !!process.env.Z_AI_CONFIG,
     Z_AI_CONFIG_length: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.length : 0,
-    Z_AI_CONFIG_starts_with: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.substring(0, 20) : null,
+    Z_AI_CONFIG_first_100: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.substring(0, 100) : null,
+    Z_AI_CONFIG_last_50: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.substring(process.env.Z_AI_CONFIG.length - 50) : null,
+    parseResult,
+    parseError,
     visible_env_keys: envKeys.slice(0, 30),
     cwd: process.cwd(),
     home: os.homedir(),
