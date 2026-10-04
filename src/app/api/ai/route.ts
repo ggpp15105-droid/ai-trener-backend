@@ -1,14 +1,42 @@
 // @ts-nocheck
 import { NextRequest, NextResponse } from "next/server";
 import ZAI from "z-ai-web-dev-sdk";
+import fs from "fs";
+import path from "path";
 
-// Кэшируем инстанс SDK между запросами — дорого создавать каждый раз
-let zaiInstance: Awaited<ReturnType<typeof ZAI.create>> | null = null;
+function ensureZAiConfig() {
+  const configPaths = [
+    path.join(process.cwd(), ".z-ai-config"),
+    path.join(process.env.HOME || "/tmp", ".z-ai-config"),
+    "/etc/.z-ai-config",
+  ];
+  for (const p of configPaths) {
+    try { if (fs.existsSync(p)) return; } catch (e) {}
+  }
+  const envConfig = process.env.Z_AI_CONFIG;
+  if (envConfig) {
+    try {
+      const target = path.join(process.cwd(), ".z-ai-config");
+      fs.writeFileSync(target, envConfig, { mode: 0o600 });
+      console.log("[ai] wrote .z-ai-config from Z_AI_CONFIG env var");
+    } catch (e) {
+      console.error("[ai] failed to write .z-ai-config:", e);
+    }
+  }
+}
+
+let zaiInstance = null;
+let zaiInited = false;
 async function getZai() {
+  if (!zaiInited) {
+    ensureZAiConfig();
+    zaiInited = true;
+  }
   if (!zaiInstance) {
     zaiInstance = await ZAI.create();
   }
   return zaiInstance;
+}
 }
 
 type Action =
