@@ -37,7 +37,6 @@ async function getZai() {
   }
   return zaiInstance;
 }
-}
 
 type Action =
   | { type: "replace_plan"; plan: PlanShape }
