@@ -446,6 +446,18 @@ function sanitizeActions(actions: Action[]): Action[] {
   return out;
 }
 
+export async function GET() {
+  const envKeys = Object.keys(process.env).filter(k => !k.startsWith("npm_") && !k.startsWith("VERCEL_") && !k.startsWith("NEXT_"));
+  return NextResponse.json({
+    has_Z_AI_CONFIG: !!process.env.Z_AI_CONFIG,
+    Z_AI_CONFIG_length: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.length : 0,
+    Z_AI_CONFIG_starts_with: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.substring(0, 20) : null,
+    visible_env_keys: envKeys.slice(0, 30),
+    cwd: process.cwd(),
+    home: os.homedir(),
+  });
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
