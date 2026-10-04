@@ -10,11 +10,44 @@ let zaiInstance = null;
 function parseConfigFromEnvOrFile() {
   const envConfig = process.env.Z_AI_CONFIG;
   if (envConfig) {
-    try {
-      const c = JSON.parse(envConfig);
-      if (c.baseUrl && c.apiKey) return c;
-    } catch (e) {}
+    // Vercel иногда экранирует кавычки в env-переменных, что ломает JSON.parse.
+    // Пробуем несколько стратегий парсинга.
+    let c = null;
+
+    // Попытка 1: как есть
+    try { c = JSON.parse(envConfig); } catch (e) {}
+
+    // Попытка 2: если есть escaped кавычки \" — делаем unescape
+    if (!c && envConfig.indexOf('\\"') >= 0) {
+      try { c = JSON.parse(envConfig.replace(/\\"/g, '"')); } catch (e) {}
+    }
+
+    // Попытка 3: берём подстроку от первого { до последнего }, потом unescape
+    if (!c) {
+      const first = envConfig.indexOf('{');
+      const last = envConfig.lastIndexOf('}');
+      if (first >= 0 && last > first) {
+        const substr = envConfig.substring(first, last + 1);
+        try { c = JSON.parse(substr); } catch (e) {}
+        if (!c && substr.indexOf('\\"') >= 0) {
+          try { c = JSON.parse(substr.replace(/\\"/g, '"')); } catch (e) {}
+        }
+      }
+    }
+
+    // Попытка 4: может это JSON-stringified JSON (т.е. строка в строке)
+    if (!c) {
+      try {
+        const inner = JSON.parse(envConfig);
+        if (typeof inner === 'string') {
+          try { c = JSON.parse(inner); } catch (e) {}
+        }
+      } catch (e) {}
+    }
+
+    if (c && c.baseUrl && c.apiKey) return c;
   }
+  // 2) Пробуем стандартные пути (для локального dev)
   const homeDir = os.homedir();
   const configPaths = [
     path.join(process.cwd(), ".z-ai-config"),
@@ -68,7 +101,7 @@ interface BlockShape {
 }
 
 interface DayShape {
-  dayOfWeek: number; // 1=Пн ... 7=Вс
+  dayOfWeek: number;
   title: string;
   blocks: BlockShape[];
 }
@@ -80,7 +113,6 @@ interface PlanShape {
   basis?: string;
 }
 
-// Системный промпт — задаёт роль, стиль и формат действий
 const SYSTEM_PROMPT = `Ты — персональный AI-тренер в веб-приложении «AI-Тренер».
 Твоя задача — помогать пользователю с тренировками, питанием, восстановлением и техникой.
 Ты можешь не только давать советы текстом, но и НАПРЯМУЮ ИЗМЕНЯТЬ план пользователя.
@@ -172,42 +204,23 @@ interface ParsedActions {
   actions: Action[];
 }
 
-// Чиним частые ошибки LLM в JSON:
-//  1) "reps":30-45 сек  →  "reps":"30-45 сек"
-//  2) "reps":10         →  "reps":"10"
-//  3) Дисбаланс скобок — авто-балансировка
-function fixJsonString(raw: string): string {
+function fixJsonString(raw) {
   let out = raw;
-  // 1) диапазоны с единицами измерения
   out = out.replace(
     /"(reps|note)":\s*(\d+\s*-\s*\d+\s*[а-яА-Яa-zA-Z\s]*)/g,
-    (_m, key: string, val: string) => `"${key}":"${val.trim()}"`
+    (_m, key, val) => `"${key}":"${val.trim()}"`
   );
-  // 2) bare number → string (только для reps)
   out = out.replace(
     /"reps":\s*(\d+(?:\s*-\s*\d+)?)\s*([,}])/g,
-    (_m, val: string, sep: string) => `"reps":"${val}"${sep}`
+    (_m, val, sep) => `"reps":"${val}"${sep}`
   );
-  // 3) Балансировка скобок — считаем и обрезаем/добавляем с конца
-  function countBalance(s: string): { braces: number; brackets: number } {
-    let ob = 0,
-      obk = 0,
-      ins = false,
-      esc = false;
+  function countBalance(s) {
+    let ob = 0, obk = 0, ins = false, esc = false;
     for (let i = 0; i < s.length; i++) {
       const ch = s[i];
-      if (esc) {
-        esc = false;
-        continue;
-      }
-      if (ch === "\\") {
-        esc = true;
-        continue;
-      }
-      if (ch === '"') {
-        ins = !ins;
-        continue;
-      }
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === '"') { ins = !ins; continue; }
       if (ins) continue;
       if (ch === "{") ob++;
       else if (ch === "}") ob--;
@@ -216,49 +229,36 @@ function fixJsonString(raw: string): string {
     }
     return { braces: ob, brackets: obk };
   }
-
   const bal = countBalance(out);
   if (bal.braces < 0 || bal.brackets < 0) {
-    // Лишние закрывающие — обрезаем с конца
     let toTrim = -bal.braces + -bal.brackets;
     let end = out.length;
     while (toTrim > 0 && end > 0) {
       const ch = out[end - 1];
-      if (ch === "}" || ch === "]") {
-        end--;
-        toTrim--;
-      } else if (ch === "\n" || ch === " " || ch === "\t" || ch === "\r") {
-        end--;
-      } else {
-        break;
-      }
+      if (ch === "}" || ch === "]") { end--; toTrim--; }
+      else if (ch === "\n" || ch === " " || ch === "\t" || ch === "\r") { end--; }
+      else { break; }
     }
     out = out.substring(0, end);
   }
   if (bal.braces > 0 || bal.brackets > 0) {
-    out =
-      out +
-      "]".repeat(Math.max(0, bal.brackets)) +
-      "}".repeat(Math.max(0, bal.braces));
+    out = out + "]".repeat(Math.max(0, bal.brackets)) + "}".repeat(Math.max(0, bal.braces));
   }
   return out;
 }
 
-// Парсер action-блоков из ответа AI
-function parseActions(raw: string): ParsedActions {
-  // Ищем блок ```actions ... ``` — толерантно к whitespace и переносу строк
+function parseActions(raw) {
   const re = /```actions\s*?\n?([\s\S]*?)```/g;
-  const actions: Action[] = [];
+  const actions = [];
   let cleanText = raw;
-  let match: RegExpExecArray | null;
+  let match;
   while ((match = re.exec(raw)) !== null) {
     const fixed = fixJsonString(match[1]);
-    // Пробуем несколько стратегий парсинга — от простого к агрессивному
     const parsed = tryParseActionsJson(fixed);
     if (Array.isArray(parsed?.actions)) {
       for (const a of parsed.actions) {
         if (a && typeof a === "object" && typeof a.type === "string") {
-          actions.push(a as Action);
+          actions.push(a);
         }
       }
     }
@@ -269,20 +269,12 @@ function parseActions(raw: string): ParsedActions {
   return { cleanText, actions };
 }
 
-// Пытается распарсить JSON с actions — пробует несколько стратегий:
-//  1) прямой parse
-//  2) итеративно удаляем одну лишнюю } или ] в середине и пробуем снова
-function tryParseActionsJson(s: string): { actions: unknown[] } | null {
-  // Стратегия 1: прямой парс
+function tryParseActionsJson(s) {
   try {
     const p = JSON.parse(s);
     if (Array.isArray(p?.actions)) return p;
-  } catch {
-    // продолжаем
-  }
-  // Стратегия 2: находим все позиции где есть `}}` или `]]` (двойные)
-  // и пробуем удалить одну из них
-  const candidates: string[] = [];
+  } catch (e) {}
+  const candidates = [];
   for (let i = 0; i < s.length - 1 && candidates.length < 30; i++) {
     if (s[i] === "}" && s[i + 1] === "}") {
       candidates.push(s.substring(0, i + 1) + s.substring(i + 2));
@@ -295,73 +287,49 @@ function tryParseActionsJson(s: string): { actions: unknown[] } | null {
     try {
       const p = JSON.parse(c);
       if (Array.isArray(p?.actions)) return p;
-    } catch {
-      // продолжаем
-    }
+    } catch (e) {}
   }
-  // Стратегия 3: перебираем все позиции ] и } — пробуем удалять по одной
   for (let i = 0; i < s.length; i++) {
     if (s[i] === "]") {
       const c = s.substring(0, i) + s.substring(i + 1);
       try {
         const p = JSON.parse(c);
         if (Array.isArray(p?.actions)) return p;
-      } catch {
-        // продолжаем
-      }
+      } catch (e) {}
     }
     if (s[i] === "}") {
       const c = s.substring(0, i) + s.substring(i + 1);
       try {
         const p = JSON.parse(c);
         if (Array.isArray(p?.actions)) return p;
-      } catch {
-        // продолжаем
-      }
+      } catch (e) {}
     }
   }
-  // Стратегия 4: добавляем недостающие ] или } в конец
   const bal = countBalance(s);
   if (bal.brackets > 0) {
     const added = s + "]".repeat(bal.brackets);
     try {
       const p = JSON.parse(added);
       if (Array.isArray(p?.actions)) return p;
-    } catch {
-      // продолжаем
-    }
+    } catch (e) {}
   }
   if (bal.braces > 0) {
     const added = s + "}".repeat(bal.braces);
     try {
       const p = JSON.parse(added);
       if (Array.isArray(p?.actions)) return p;
-    } catch {
-      // продолжаем
-    }
+    } catch (e) {}
   }
   return null;
 }
 
-function countBalance(s: string): { braces: number; brackets: number } {
-  let ob = 0,
-    obk = 0,
-    ins = false,
-    esc = false;
+function countBalance(s) {
+  let ob = 0, obk = 0, ins = false, esc = false;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (esc) {
-      esc = false;
-      continue;
-    }
-    if (ch === "\\") {
-      esc = true;
-      continue;
-    }
-    if (ch === '"') {
-      ins = !ins;
-      continue;
-    }
+    if (esc) { esc = false; continue; }
+    if (ch === "\\") { esc = true; continue; }
+    if (ch === '"') { ins = !ins; continue; }
     if (ins) continue;
     if (ch === "{") ob++;
     else if (ch === "}") ob--;
@@ -371,46 +339,40 @@ function countBalance(s: string): { braces: number; brackets: number } {
   return { braces: ob, brackets: obk };
 }
 
-// Минимальная валидация плана — чтобы не положить приложение битым JSON
-function isValidPlan(p: unknown): p is PlanShape {
+function isValidPlan(p) {
   if (!p || typeof p !== "object") return false;
-  const o = p as Record<string, unknown>;
-  if (typeof o.title !== "string") return false;
-  if (typeof o.durationWeeks !== "number") return false;
-  if (!Array.isArray(o.weeks)) return false;
-  for (const w of o.weeks as unknown[]) {
+  if (typeof p.title !== "string") return false;
+  if (typeof p.durationWeeks !== "number") return false;
+  if (!Array.isArray(p.weeks)) return false;
+  for (const w of p.weeks) {
     if (!w || typeof w !== "object") return false;
-    const wObj = w as Record<string, unknown>;
-    if (typeof wObj.weekNumber !== "number") return false;
-    if (typeof wObj.note !== "string") return false;
-    if (!Array.isArray(wObj.days)) return false;
-    for (const d of wObj.days as unknown[]) {
+    if (typeof w.weekNumber !== "number") return false;
+    if (typeof w.note !== "string") return false;
+    if (!Array.isArray(w.days)) return false;
+    for (const d of w.days) {
       if (!d || typeof d !== "object") return false;
-      const dObj = d as Record<string, unknown>;
-      if (typeof dObj.dayOfWeek !== "number") return false;
-      if (typeof dObj.title !== "string") return false;
-      if (!Array.isArray(dObj.blocks)) return false;
-      for (const b of dObj.blocks as unknown[]) {
+      if (typeof d.dayOfWeek !== "number") return false;
+      if (typeof d.title !== "string") return false;
+      if (!Array.isArray(d.blocks)) return false;
+      for (const b of d.blocks) {
         if (!b || typeof b !== "object") return false;
-        const bObj = b as Record<string, unknown>;
-        if (typeof bObj.exerciseId !== "string") return false;
-        if (typeof bObj.sets !== "number") return false;
-        if (typeof bObj.reps !== "string") return false;
-        if (bObj.weightKg !== null && typeof bObj.weightKg !== "number") return false;
-        if (typeof bObj.restSec !== "number") return false;
+        if (typeof b.exerciseId !== "string") return false;
+        if (typeof b.sets !== "number") return false;
+        if (typeof b.reps !== "string") return false;
+        if (b.weightKg !== null && typeof b.weightKg !== "number") return false;
+        if (typeof b.restSec !== "number") return false;
       }
     }
   }
   return true;
 }
 
-function sanitizeActions(actions: Action[]): Action[] {
-  const out: Action[] = [];
+function sanitizeActions(actions) {
+  const out = [];
   for (const a of actions) {
     if (a.type === "replace_plan") {
       if (isValidPlan(a.plan)) {
-        // Добавляем createdAt если нет
-        const plan = a.plan as PlanShape & { createdAt?: string };
+        const plan = a.plan;
         if (!plan.createdAt) plan.createdAt = new Date().toISOString();
         out.push({ type: "replace_plan", plan });
       }
@@ -467,6 +429,7 @@ export async function GET() {
     has_Z_AI_CONFIG: !!process.env.Z_AI_CONFIG,
     Z_AI_CONFIG_length: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.length : 0,
     Z_AI_CONFIG_first_100: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.substring(0, 100) : null,
+    Z_AI_CONFIG_middle_50: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.substring(400, 450) : null,
     Z_AI_CONFIG_last_50: process.env.Z_AI_CONFIG ? process.env.Z_AI_CONFIG.substring(process.env.Z_AI_CONFIG.length - 50) : null,
     parseResult,
     parseError,
@@ -476,12 +439,12 @@ export async function GET() {
   });
 }
 
-export async function POST(req: NextRequest) {
+export async function POST(req) {
   try {
     const body = await req.json().catch(() => ({}));
-    const message: string = (body.message || "").toString().trim();
-    const context: string = (body.context || "").toString().trim();
-    const history: string = (body.history || "").toString().trim();
+    const message = (body.message || "").toString().trim();
+    const context = (body.context || "").toString().trim();
+    const history = (body.history || "").toString().trim();
 
     if (!message) {
       return NextResponse.json(
@@ -498,26 +461,21 @@ export async function POST(req: NextRequest) {
 
     const zai = await getZai();
 
-    const messages: { role: "assistant" | "user"; content: string }[] = [
+    const messages = [
       { role: "assistant", content: SYSTEM_PROMPT },
     ];
 
     if (context) {
       messages.push({
         role: "assistant",
-        content:
-          "Вот текущий контекст пользователя из приложения. Учитывай его при ответе:\n\n" +
-          context,
+        content: "Вот текущий контекст пользователя из приложения. Учитывай его при ответе:\n\n" + context,
       });
     }
 
-    // Если есть история диалога — добавляем её как assistant note, чтобы AI помнил контекст
     if (history) {
       messages.push({
         role: "assistant",
-        content:
-          "Вот предыдущая история диалога (последние сообщения). Используй её, чтобы не задавать уточняющие вопросы повторно:\n\n" +
-          history,
+        content: "Вот предыдущая история диалога (последние сообщения). Используй её, чтобы не задавать уточняющие вопросы повторно:\n\n" + history,
       });
     }
 
@@ -527,13 +485,11 @@ export async function POST(req: NextRequest) {
       messages,
       thinking: { type: "disabled" },
       max_tokens: 16000,
-    } as Record<string, unknown>);
+    });
 
     let rawAnswer = completion.choices?.[0]?.message?.content?.trim() || "";
 
-    // Если AI обрезал ответ (force recompile) на блоке actions — продолжаем генерацию.
-    // Проверяем: есть ли ```actions в ответе, и есть ли после него закрывающий ```
-    function hasUnclosedActionsBlock(text: string): boolean {
+    function hasUnclosedActionsBlock(text) {
       const startIdx = text.indexOf("```actions");
       if (startIdx < 0) return false;
       const after = text.slice(startIdx + "```actions".length);
@@ -543,13 +499,12 @@ export async function POST(req: NextRequest) {
     let continuationTries = 0;
     while (continuationTries < 3 && hasUnclosedActionsBlock(rawAnswer)) {
       continuationTries++;
-      const continueMessages: { role: "assistant" | "user"; content: string }[] = [
+      const continueMessages = [
         ...messages,
         { role: "assistant", content: rawAnswer },
         {
           role: "user",
-          content:
-            "Продолжи свой ответ с того места, где остановился. Не повторяй уже написанное, просто допиши окончание JSON-блока действий и закрой его тремя обратными кавычками (```)",
+          content: "Продолжи свой ответ с того места, где остановился. Не повторяй уже написанное, просто допиши окончание JSON-блока действий и закрой его тремя обратными кавычками (```)",
         },
       ];
       try {
@@ -557,14 +512,14 @@ export async function POST(req: NextRequest) {
           messages: continueMessages,
           thinking: { type: "disabled" },
           max_tokens: 16000,
-        } as Record<string, unknown>);
+        });
         const contText = cont.choices?.[0]?.message?.content?.trim() || "";
         if (contText) {
           rawAnswer = rawAnswer + contText;
         } else {
           break;
         }
-      } catch {
+      } catch (e) {
         break;
       }
     }
@@ -576,7 +531,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Парсим actions из ответа
     const { cleanText, actions } = parseActions(rawAnswer);
     const sanitized = sanitizeActions(actions);
 
@@ -585,7 +539,7 @@ export async function POST(req: NextRequest) {
       answer: cleanText,
       actions: sanitized,
     });
-  } catch (err: unknown) {
+  } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
     console.error("[/api/ai] error:", msg);
     return NextResponse.json(
@@ -596,4 +550,3 @@ export async function POST(req: NextRequest) {
 }
 
 export const dynamic = "force-dynamic";
-// touched at Sun Oct  4 19:15:27 UTC 2026
